@@ -1,0 +1,400 @@
+#include <Adafruit_GFX.h>    // Core graphics library for drawing shapes, text, etc.
+#include <Adafruit_ST7789.h> // Hardware-specific library for the ST7789 display
+#include <SPI.h>             // SPI communication library
+#include <SD.h>              // Library for handling SD card
+#include <Adafruit_VS1053.h> // Library for VS1053 audio decoder chip
+
+// Pin definitions for VS1053 module
+#define VS1053_RESET   -1    // Reset pin (not used in this setup)
+#define VS1053_DCS      10    // Data/Command Select pin
+#define VS1053_DREQ     9     // Data Request pin, suitable for interrupt
+#define VS1053_CS       6     // Chip Select pin
+#define CARDCS          5     // SD Card Chip Select pin
+
+// Analog knob and volume range
+#define KNOB_MIN        0     // Minimum ADC value
+#define KNOB_MAX        1023  // Maximum ADC value
+#define VOL_MIN         0     // Minimum volume (loudest)
+#define VOL_MAX         50    // Maximum volume (quietest)
+#define TRACKS_MAX      100   // Maximum number of tracks supported
+
+// TFT and music player objects
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+Adafruit_VS1053_FilePlayer musicPlayer = Adafruit_VS1053_FilePlayer(VS1053_RESET, VS1053_CS, VS1053_DCS, VS1053_DREQ, CARDCS);
+
+float p = 3.1415926;          // Pi constant for calculations
+int led = LED_BUILTIN;        // Built-in LED pin
+int Play_button = 0;          // Pin for Play button
+int Pause_button = 1;         // Pin for Pause button
+int Next_button = 2;          // Pin for Next button
+
+// Variables for knob control and volume
+int volume = 50;              // Default volume level
+int currentTrack, totalTracks; // Track management
+char trackListing[TRACKS_MAX][15] = {' '}; // Array to hold track names
+char temp[16];                // Temporary buffer for filenames
+
+// Debounce settings to prevent multiple button triggers
+volatile unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50; // Debounce time in milliseconds
+
+// Flags for button press detection
+volatile bool playPressed = false;
+volatile bool pausePressed = false;
+volatile bool nextPressed = false;
+
+// Interrupt Service Routines (ISRs) for button presses
+void IRAM_ATTR playISR() {
+  if (millis() - lastDebounceTime > debounceDelay) {
+    playPressed = true;
+    lastDebounceTime = millis();
+  }
+}
+
+void IRAM_ATTR pauseISR() {
+  if (millis() - lastDebounceTime > debounceDelay) {
+    pausePressed = true;
+    lastDebounceTime = millis();
+  }
+}
+
+void IRAM_ATTR nextISR() {
+  if (millis() - lastDebounceTime > debounceDelay) {
+    nextPressed = true;
+    lastDebounceTime = millis();
+  }
+}
+
+void setup() {
+  Serial.begin(9600);              // Initialize serial communication
+
+  // Set button pins as input with pull-up/pull-down resistors
+  pinMode(Play_button, INPUT_PULLUP);
+  pinMode(Pause_button, INPUT_PULLDOWN);
+  pinMode(Next_button, INPUT_PULLDOWN);
+
+  pinMode(TFT_BACKLITE, OUTPUT);   // TFT backlight control
+  pinMode(TFT_I2C_POWER, OUTPUT);  // Power supply control for TFT/I2C
+
+  setup_TFT();                     // Initialize TFT display
+
+  // Initialize the music player
+  if (!musicPlayer.begin()) {
+    Serial.println(F("Couldn't find VS1053, check pin connections."));
+    while (1) delay(100);
+  }
+  Serial.println(F("VS1053 found"));
+  musicPlayer.softReset();         // Perform a soft reset on VS1053
+
+  // Set initial volume
+  Serial.print("Volume = "); Serial.println(volume);
+  musicPlayer.setVolume(volume, volume);
+
+  // Initialize SD card
+  if (!SD.begin(CARDCS)) {
+    Serial.println(F("SD card initialization failed."));
+    while (1) delay(100);
+  }
+  Serial.println("SD card OK!");
+
+  // Load the list of tracks from SD card
+  Serial.println("Track Listing:\n=============");
+  totalTracks = 0;
+  readDirectory(SD.open("/"), 0);
+  currentTrack = 0;
+
+  // Setup interrupts for button presses
+  musicPlayer.useInterrupt(VS1053_FILEPLAYER_PIN_INT);
+  attachInterrupt(digitalPinToInterrupt(Play_button), playISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(Pause_button), pauseISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(Next_button), nextISR, FALLING);
+}
+
+void loop() {
+  // Handle play button press
+  if (playPressed) {
+    playPressed = false;
+    Serial.print("Playing: "); Serial.println(trackListing[currentTrack]);
+
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(0, 0);
+    tft.println("Now Playing:");
+    tft.setCursor(0, 30);
+    tft.println(trackListing[currentTrack]);
+    delay(250);
+
+    musicPlayer.startPlayingFile(trackListing[currentTrack]); //Starts playing song 
+  }
+
+  // Handle pause button press
+  if (pausePressed) {
+    pausePressed = false;
+    Serial.println("1");
+    if (!musicPlayer.stopped()) {
+      Serial.println("2");
+      if (musicPlayer.paused()) {
+        Serial.println("Resumed");
+        tft.fillScreen(ST77XX_BLACK);
+        tft.setTextSize(2);
+        tft.setCursor(0, 0);
+        tft.println("Playback Resumed");
+        delay(250);
+        musicPlayer.pausePlaying(false); //Resumes Song 
+      } else {
+        Serial.println("Paused");
+        Serial.println("3");
+        delay(250);
+        musicPlayer.pausePlaying(true); //Pauses Song
+         tft.fillScreen(ST77XX_BLACK);
+        tft.setTextSize(2);
+        tft.setCursor(0, 0);
+        tft.println("Playback Paused");
+        Serial.println("7");
+      }
+    }
+  }
+
+  // Handle next button press
+  if (nextPressed) {
+    nextPressed = false;
+
+    Serial.println("Next Track");
+    if (!musicPlayer.stopped()) {
+      Serial.println("Stopping current playback.");
+      musicPlayer.stopPlaying();
+    }
+    currentTrack = ++currentTrack < totalTracks ? currentTrack : 0;
+    Serial.print("Next "); Serial.println(trackListing[currentTrack]);
+
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(0, 0);
+    tft.println("Next Track:");
+    tft.setCursor(0, 30);
+    tft.println(trackListing[currentTrack]);
+    delay(250);
+    musicPlayer.startPlayingFile(trackListing[currentTrack]);
+  }
+
+  // Display effects when music is stopped
+  if (musicPlayer.stopped()) {
+    testtriangles();
+  }
+}
+
+// Function to read directory contents from SD card
+void readDirectory(File dir, int numTabs) {
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) break;
+
+    for (uint8_t i = 0; i < numTabs; i++) {
+      Serial.print('\t');
+    }
+    if (!entry.isDirectory()) {
+      snprintf(temp, sizeof(temp), "/%s", entry.name());
+      strncpy(trackListing[totalTracks], temp, 15);
+      Serial.print(trackListing[totalTracks]); Serial.print("="); Serial.println(totalTracks);
+      totalTracks++;
+    }
+    entry.close();
+  }
+}
+
+void setup_TFT()
+{
+  // turn on backlite
+  digitalWrite(TFT_BACKLITE, HIGH);
+
+  // turn on the TFT / I2C power supply
+  digitalWrite(TFT_I2C_POWER, HIGH);
+  delay(10);
+
+  tft.init(135, 240); // Init ST7789 240x135
+  tft.setRotation(3);
+  tft.fillScreen(ST77XX_BLACK);
+
+  Serial.println(F("Initialized"));
+
+  tft.fillScreen(ST77XX_BLACK);
+  testdrawtext(
+      "System Ready!, Init test now.  Please wait.",
+      ST77XX_WHITE);
+  delay(1000);
+  
+  start_up_effects();
+
+  delay(500);
+}
+
+
+void testdrawtext(char *text, uint16_t color) {
+  tft.setCursor(0, 0);
+  tft.setTextSize(2);
+  tft.setTextColor(color);
+  tft.setTextWrap(true);
+  tft.print(text);
+}
+
+void start_up_effects()
+{
+  //LINES
+  uint16_t color = ST77XX_YELLOW;
+  tft.fillScreen(ST77XX_BLACK);
+  for (int16_t x = 0; x < tft.width(); x += 6) {
+    tft.drawLine(0, 0, x, tft.height() - 1, color);
+    delay(0);
+  }
+  for (int16_t y = 0; y < tft.height(); y += 6) {
+    tft.drawLine(0, 0, tft.width() - 1, y, color);
+    delay(0);
+  }
+
+  tft.fillScreen(ST77XX_BLACK);
+  for (int16_t x = 0; x < tft.width(); x += 6) {
+    tft.drawLine(tft.width() - 1, 0, x, tft.height() - 1, color);
+    delay(0);
+  }
+  for (int16_t y = 0; y < tft.height(); y += 6) {
+    tft.drawLine(tft.width() - 1, 0, 0, y, color);
+    delay(0);
+  }
+
+  tft.fillScreen(ST77XX_BLACK);
+  for (int16_t x = 0; x < tft.width(); x += 6) {
+    tft.drawLine(0, tft.height() - 1, x, 0, color);
+    delay(0);
+  }
+  for (int16_t y = 0; y < tft.height(); y += 6) {
+    tft.drawLine(0, tft.height() - 1, tft.width() - 1, y, color);
+    delay(0);
+  }
+
+  tft.fillScreen(ST77XX_BLACK);
+  for (int16_t x = 0; x < tft.width(); x += 6) {
+    tft.drawLine(tft.width() - 1, tft.height() - 1, x, 0, color);
+    delay(0);
+  }
+  for (int16_t y = 0; y < tft.height(); y += 6) {
+    tft.drawLine(tft.width() - 1, tft.height() - 1, 0, y, color);
+    delay(0);
+  }
+
+  delay(500);
+
+  //FAST LINES
+  uint16_t color1 = ST77XX_RED;
+  uint16_t color2 = ST77XX_BLUE;
+
+  tft.fillScreen(ST77XX_BLACK);
+  for (int16_t y = 0; y < tft.height(); y += 5) {
+    tft.drawFastHLine(0, y, tft.width(), color1);
+  }
+  for (int16_t x = 0; x < tft.width(); x += 5) {
+    tft.drawFastVLine(x, 0, tft.height(), color2);
+  }
+
+  delay(500);
+
+  //DRAWRECTS
+  color = ST77XX_GREEN;
+  tft.fillScreen(ST77XX_BLACK);
+  for (int16_t x = 0; x < tft.width(); x += 6) {
+    tft.drawRect(tft.width() / 2 - x / 2, tft.height() / 2 - x / 2, x, x,
+                 color);
+  }
+
+  delay(500);
+
+  //FILLSRECTS
+  color1 = ST77XX_YELLOW;
+  color2 = ST77XX_MAGENTA;
+  tft.fillScreen(ST77XX_BLACK);
+  for (int16_t x = tft.width() - 1; x > 6; x -= 6) {
+    tft.fillRect(tft.width() / 2 - x / 2, tft.height() / 2 - x / 2, x, x,
+                 color1);
+    tft.drawRect(tft.width() / 2 - x / 2, tft.height() / 2 - x / 2, x, x,
+                 color2);
+  }
+
+  delay(500);
+
+  //FILLCIRCLES 
+  uint8_t radius = 10;
+  color = ST77XX_BLUE;
+  tft.fillScreen(ST77XX_BLACK);
+  for (int16_t x = radius; x < tft.width(); x += radius * 2) {
+    for (int16_t y = radius; y < tft.height(); y += radius * 2) {
+      tft.fillCircle(x, y, radius, color);
+    }
+  }
+  delay(500);
+
+  //Draw Circles 
+  radius = 10;
+  color = ST77XX_BLUE;
+  for (int16_t x = 0; x < tft.width() + radius; x += radius * 2) {
+    for (int16_t y = 0; y < tft.height() + radius; y += radius * 2) {
+      tft.drawCircle(x, y, radius, color);
+    }
+  }
+  delay(500);
+
+  tft.fillScreen(ST77XX_BLACK);
+  color = 100;
+  int i;
+  int t;
+  for (t = 0; t <= 4; t += 1) {
+    int x = 0;
+    int y = 0;
+    int w = tft.width() - 2;
+    int h = tft.height() - 2;
+    for (i = 0; i <= 16; i += 1) {
+      tft.drawRoundRect(x, y, w, h, 5, color);
+      x += 2;
+      y += 3;
+      w -= 4;
+      h -= 6;
+      color += 1100;
+    }
+    color += 100;
+  }
+  delay(500);
+}
+
+void testtriangles() {
+  tft.fillScreen(ST77XX_BLACK);
+  uint16_t color = 0xF800;
+  int t;
+  int w = tft.width() / 2;
+  int x = tft.height();
+  int y = 0;
+  int z = tft.width();
+
+  for (t = 0; t <= 15; t++) {
+    tft.drawTriangle(w, y, y, x -1, z, x, color);
+    x -= 4;
+    y += 4;
+    z -= 4;
+    color += 100;
+    delay(10);
+  }
+  delay(1000);
+  tft.fillScreen(ST77XX_BLACK);
+  color = 0xF800;
+  w = tft.width() / 2;
+  x = 0;
+  y = 0;
+  z = tft.width();
+  int h = tft.height();
+  for (t = 0; t <= 15; t++) {
+    tft.drawTriangle(w, h - y, y, x, z, x, color);
+    x += 4;
+    y += 4;
+    z -= 4;
+    color += 100;
+    delay(10);
+  }
+  delay(1000);
+}
